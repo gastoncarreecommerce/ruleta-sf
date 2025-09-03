@@ -89,6 +89,11 @@ export default async function handler(req, res) {
       values
     });
 
+    const parsed = parseSoapCreateResponse(soapResp.body);
+if (!parsed.ok) {
+  return res.status(502).json({ ok:false, error:'sfmc_soap', detail: parsed });
+}
+
     return res.status(200).json({
       ok: true,
       saved: {
@@ -209,4 +214,12 @@ function escapeXml(s) {
 
 function sha256Lower(email) {
   return crypto.createHash('sha256').update(String(email).toLowerCase()).digest('hex');
+}
+function parseSoapCreateResponse(xml) {
+  const overall = (xml.match(/<OverallStatus>([^<]+)<\/OverallStatus>/i) || [])[1] || '';
+  const status  = (xml.match(/<StatusMessage>([^<]+)<\/StatusMessage>/i) || [])[1] || '';
+  const reqId   = (xml.match(/<RequestID>([^<]+)<\/RequestID>/i) || [])[1] || '';
+  const codes   = Array.from(xml.matchAll(/<ErrorCode>([^<]+)<\/ErrorCode>/ig)).map(m => m[1]);
+  const ok = /OK/i.test(overall) || /OK/i.test(status);
+  return { ok, overall, status, requestId: reqId, errors: codes };
 }
