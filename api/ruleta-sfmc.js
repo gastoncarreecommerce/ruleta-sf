@@ -1,87 +1,130 @@
 // api/ruleta-sfmc.js
+import crypto from 'crypto';
+
 export default async function handler(req, res) {
-  // CORS básico (permití desde DY / tu dominio)
+  // CORS (en prod podés limitar a tu dominio)
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST,GET,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(204).end();
 
   try {
-    // 1) Leer email y parámetros extra
+    // 1) Leer parámetros
     const url = new URL(req.url, `http://${req.headers.host}`);
     const q = Object.fromEntries(url.searchParams.entries());
 
+    // Defaults
     let email = null;
-    let discount = q.discount ? Number(q.discount) : null;
+    let discount = q.discount != null ? Number(q.discount) : null;
     const campaign = q.campaign || 'default';
-    const variationId = q.variationId || null;
+    let variationId = q.variationId || null;
+    let result = (q.result || '').toLowerCase(); // 'won' | 'lost' (si viniera por query)
 
     if (req.method === 'POST') {
       const ctype = (req.headers['content-type'] || '').toLowerCase();
+
       if (ctype.includes('application/x-www-form-urlencoded')) {
-        const buffers = [];
-        for await (const chunk of req) buffers.push(chunk);
-        const bodyStr = Buffer.concat(buffers).toString('utf8');
+        const bodyStr = await readBody(req);
         const params = new URLSearchParams(bodyStr);
-        email = params.get('email');
+
+        // Lo que ya mandaba DY + NUEVOS campos
+        email = params.get('email') || email;
+        if (params.has('discount') && (discount == null))
+          discount = Number(params.get('discount'));
+        if (params.has('variationId') && !variationId)
+          variationId = params.get('variationId') || variationId;
+        if (params.has('result') && !result)
+          result = String(params.get('result') || '').toLowerCase();
       } else if (ctype.includes('application/json')) {
         const body = await parseJSON(req);
         email = body.email || email;
         if (body.discount != null && discount == null) discount = Number(body.discount);
+        if (body.variationId && !variationId) variationId = body.variationId;
+        if (body.result && !result) result = String(body.result).toLowerCase();
       }
     } else if (req.method === 'GET') {
       email = q.email || email;
     }
 
-    // Validaciones mínimas
+    // 2) Validaciones
     if (!email || !isValidEmail(email)) {
       return res.status(400).json({ ok: false, error: 'invalid_email' });
     }
-    // Discount puede ser null si no lo pasás como parámetro de la URL (ver Nota al final)
     if (discount != null && (isNaN(discount) || discount < 0 || discount > 100)) {
       return res.status(400).json({ ok: false, error: 'invalid_discount' });
     }
+    if (result && result !== 'won' && result !== 'lost') {
+      // normalizamos cualquier valor raro
+      result = '';
+    }
 
-    // 2) Token OAuth
+    // Opcional: sólo guardar ganadores (activar con env var)
+    if (process.env.SAVE_ONLY_WINNERS === '1' && result !== 'won') {
+      return res.status(200).json({ ok: true, skipped: 'not_winner' });
+    }
+
+    // 3) Token
     const token = await getSfmcToken();
 
-    // 3) Insert/Upsert en Data Extension vía SOAP
+    // 4) Upsert en la DE (SOAP)
     const nowIso = new Date().toISOString();
     const hashed = sha256Lower(email);
+
+    const RESULT_FIELD = process.env.SFMC_RESULT_FIELD || 'Result';
+    const VAR_FIELD = process.env.SFMC_VARIATION_FIELD || 'VariationId';
+    const values = {
+      Email: email,
+      Campaign: campaign,
+      Discount: discount != null ? String(discount) : '',
+      [RESULT_FIELD]: result || '',
+      HashedEmail: hashed,
+      Source: process.env.SFMC_SOURCE_VALUE || 'DY_Ruleta',
+      Timestamp: nowIso,
+      [VAR_FIELD]: variationId || ''
+    };
+
     const soapResp = await soapUpsertRow({
       token,
       deKey: process.env.SFMC_DE_KEY,
-      values: {
-        Email: email,
-        Campaign: campaign,
-        Discount: discount != null ? String(discount) : '',
-        HashedEmail: hashed,
-        Source: 'DY_Ruleta',
-        Timestamp: nowIso,
-        VariationId: variationId || ''
-      }
+      values
     });
 
-    return res.status(200).json({ ok: true, soap: soapResp });
+    return res.status(200).json({
+      ok: true,
+      saved: {
+        email,
+        campaign,
+        discount: values.Discount,
+        result: values[RESULT_FIELD],
+        variationId: values[VAR_FIELD]
+      },
+      soap: { status: soapResp.status }
+    });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ ok: false, error: 'server_error', detail: String(err?.message || err) });
   }
 }
 
+/* ========== helpers ========== */
+
 function isValidEmail(email) {
   return /^(([^<>()[\]\\.,;:\s@"]+(\.[^<>()[\]\\.,;:\s@"]+)*)|(".+"))@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\])|(([a-z\-0-9]+\.)+[a-z]{2,}))$/i.test(email);
 }
 
-async function parseJSON(req) {
+async function readBody(req) {
   const buffers = [];
   for await (const chunk of req) buffers.push(chunk);
-  const str = Buffer.concat(buffers).toString('utf8');
+  return Buffer.concat(buffers).toString('utf8');
+}
+
+async function parseJSON(req) {
+  const str = await readBody(req);
   return str ? JSON.parse(str) : {};
 }
 
 async function getSfmcToken() {
-  const authBase = process.env.SFMC_AUTH_BASE.replace(/\/+$/, '');
+  const authBase = (process.env.SFMC_AUTH_BASE || '').replace(/\/+$/, '');
   const body = {
     grant_type: 'client_credentials',
     client_id: process.env.SFMC_CLIENT_ID,
@@ -101,19 +144,23 @@ async function getSfmcToken() {
 }
 
 async function soapUpsertRow({ token, deKey, values }) {
-  const soapBase = (process.env.SFMC_SOAP_BASE
-    || process.env.SFMC_REST_BASE.replace('rest.', 'soap.').replace(/\/+$/, '') + '/Service.asmx');
+  if (!deKey) throw new Error('Missing SFMC_DE_KEY');
+  const soapBase =
+    process.env.SFMC_SOAP_BASE ||
+    process.env.SFMC_REST_BASE.replace('rest.', 'soap.').replace(/\/+$/, '') + '/Service.asmx';
 
-  const propsXML = Object.keys(values).map(k => `
+  const propsXML = Object.keys(values)
+    .map(
+      (k) => `
     <Property>
       <Name>${escapeXml(k)}</Name>
       <Value>${escapeXml(values[k] == null ? '' : String(values[k]))}</Value>
-    </Property>`).join('');
+    </Property>`
+    )
+    .join('');
 
-  const envelope =
-`<?xml version="1.0" encoding="UTF-8"?>
-<soapenv:Envelope
-  xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+  const envelope = `<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
   xmlns:tns="http://exacttarget.com/wsdl/partnerAPI">
   <soapenv:Header>
@@ -131,8 +178,7 @@ async function soapUpsertRow({ token, deKey, values }) {
       </tns:Options>
       <tns:Objects xsi:type="tns:DataExtensionObject">
         <tns:CustomerKey>${escapeXml(deKey)}</tns:CustomerKey>
-        <tns:Properties>
-          ${propsXML}
+        <tns:Properties>${propsXML}
         </tns:Properties>
       </tns:Objects>
     </tns:CreateRequest>
@@ -154,13 +200,13 @@ async function soapUpsertRow({ token, deKey, values }) {
 
 function escapeXml(s) {
   return String(s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
     .replace(/'/g, '&apos;');
 }
 
-// SHA-256 (lowercased email) en Node 18+ (Vercel)
-import crypto from 'crypto';
 function sha256Lower(email) {
   return crypto.createHash('sha256').update(String(email).toLowerCase()).digest('hex');
 }
