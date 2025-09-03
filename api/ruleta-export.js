@@ -2,16 +2,8 @@ export default async function handler(req, res) {
   try {
     res.setHeader("Access-Control-Allow-Origin", "*");
 
-    const token = process.env.BLOB_READ_WRITE_TOKEN;
-    if (!token) {
-      return res.status(500).json({
-        ok: false,
-        error: "missing_env",
-        detail: "Falta BLOB_READ_WRITE_TOKEN en Vercel → Project → Settings → Environment Variables",
-      });
-    }
-
-    const { list } = await import("@vercel/blob"); // ⬅️ dynamic import
+    // Import dinámico del SDK sin token (proyecto vinculado al store)
+    const { list } = await import("@vercel/blob");
 
     const url = new URL(req.url, `http://${req.headers.host}`);
     const campaign = (url.searchParams.get("campaign") || "").toLowerCase().replace(/[^a-z0-9_-]/gi, "-");
@@ -24,7 +16,7 @@ export default async function handler(req, res) {
     let cursor;
 
     do {
-      const page = await list({ prefix, token, cursor });
+      const page = await list({ prefix, cursor }); // sin token
       const blobs = page?.blobs || [];
       for (const b of blobs) {
         if (!b.pathname.endsWith(".json")) continue;
