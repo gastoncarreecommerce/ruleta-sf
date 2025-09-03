@@ -1,30 +1,31 @@
-// api/ruleta-sfmc.js
 import crypto from 'crypto';
 
-/** Requisitos de entorno:
- * SFMC_CLIENT_ID, SFMC_CLIENT_SECRET
- * SFMC_AUTH_BASE, SFMC_REST_BASE, SFMC_SOAP_BASE (con /Service.asmx)
- * SFMC_DE_KEY
- * Recomendado: SFMC_ACCOUNT_ID (MID)
- * Opcionales: SFMC_RESULT_FIELD, SFMC_VARIATION_FIELD, SFMC_SOURCE_VALUE,
- * SAVE_ONLY_WINNERS=1, SFMC_SEND_RESULT=0, SFMC_SEND_VARIATION=0,
- * SFMC_KEY_FIELDS="Email,Campaign",
- * SFMC_FIELDS_ALLOWLIST="Email,Campaign,Discount,Result,VariationId,HashedEmail,Source,Timestamp"
- */
+// === Config fija basada en TU DE ===
+// Si más adelante agregás/quitas campos en la DE, ajustá esta lista o
+// usa la env var SFMC_FIELDS_ALLOWLIST para sobreescribir.
+function getFieldList() {
+  const envList = (process.env.SFMC_FIELDS_ALLOWLIST || '').trim();
+  if (envList) return envList.split(',').map(s => s.trim()).filter(Boolean);
+  // Tu DE (según captura): Email, Campaign (PK), Result, VariationId, HashedEmail, Source, Timestamp
+  // + Discount si lo agregaste (me dijiste que sí).
+  return ['Email','Campaign','Result','VariationId','HashedEmail','Source','Timestamp','Discount'];
+}
 
 export default async function handler(req, res) {
-  // CORS (abrir a tu dominio en prod)
+  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST,GET,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(204).end();
 
+  const debugOn = (process.env.DEBUG_SOAP === '1') || /(?:[?&]debug=1)(?:$|&)/.test(req.url || '');
+
   try {
-    // ---------- 1) INPUT ----------
+    // -------- 1) INPUT --------
     const url = new URL(req.url, `http://${req.headers.host}`);
     const q = Object.fromEntries(url.searchParams.entries());
 
-    let email = null;
+    let email = q.email || null;
     let discount = q.discount != null ? Number(q.discount) : null;
     const campaign = q.campaign || 'default';
     let variationId = q.variationId || null;
@@ -46,94 +47,84 @@ export default async function handler(req, res) {
         if (body.variationId && !variationId) variationId = body.variationId;
         if (body.result && !result) result = String(body.result).toLowerCase();
       }
-    } else if (req.method === 'GET') {
-      email = q.email || email;
     }
 
-    // ---------- 2) VALIDACIONES ----------
+    // -------- 2) VALIDACIONES --------
     if (!email || !isValidEmail(email)) {
-      return res.status(400).json({ ok: false, error: 'invalid_email' });
+      return res.status(400).json({ ok:false, error:'invalid_email' });
     }
     if (discount != null && (isNaN(discount) || discount < 0 || discount > 100)) {
-      return res.status(400).json({ ok: false, error: 'invalid_discount' });
+      return res.status(400).json({ ok:false, error:'invalid_discount' });
     }
     if (result && result !== 'won' && result !== 'lost') result = '';
 
     if (process.env.SAVE_ONLY_WINNERS === '1' && result !== 'won') {
-      return res.status(200).json({ ok: true, skipped: 'not_winner' });
+      return res.status(200).json({ ok:true, skipped:'not_winner' });
     }
 
-    // ---------- 3) TOKEN ----------
+    // -------- 3) TOKEN --------
     const token = await getSfmcToken();
 
-    // ---------- 4) Descubrir campos válidos de la DE ----------
-    const deKey = process.env.SFMC_DE_KEY;
-    if (!deKey) throw new Error('Missing SFMC_DE_KEY');
-
-    let validFields = null;
-    const allow = (process.env.SFMC_FIELDS_ALLOWLIST || '')
-      .split(',').map(s => s.trim()).filter(Boolean);
-    if (allow.length) {
-      validFields = new Set(allow);
-    } else {
-      const fields = await retrieveDeFields({ token, deKey });
-      validFields = new Set(fields); // exactos según SFMC
-    }
-
-    // ---------- 5) Armar valores ----------
+    // -------- 4) ARMAR PROPS EN BASE A TU DE --------
     const nowIso = new Date().toISOString();
     const hashed = sha256Lower(email);
     const RESULT_FIELD = process.env.SFMC_RESULT_FIELD || 'Result';
     const VAR_FIELD    = process.env.SFMC_VARIATION_FIELD || 'VariationId';
 
-    const valuesBase = {
+    const allValues = {
       Email: email,
       Campaign: campaign,
+      [RESULT_FIELD]: result || '',
+      [VAR_FIELD]: variationId || '',
       HashedEmail: hashed,
       Source: process.env.SFMC_SOURCE_VALUE || 'DY_Ruleta',
       Timestamp: nowIso
     };
-    if (!isNaN(discount) && discount !== null) valuesBase.Discount = String(discount);
-    if (process.env.SFMC_SEND_RESULT !== '0')    valuesBase[RESULT_FIELD] = result || '';
-    if (process.env.SFMC_SEND_VARIATION !== '0') valuesBase[VAR_FIELD]    = variationId || '';
+    // Solo enviar Discount si viene número (para no borrar)
+    if (!isNaN(discount) && discount !== null) allValues.Discount = String(discount);
 
-    // Filtrar a solo campos que EXISTEN en la DE
-    const valuesFiltered = pickExisting(valuesBase, validFields);
+    // Tomar SOLO los campos de la lista (no dependemos de SOAP discover)
+    const allowed = new Set(getFieldList());
+    const propsToSend = {};
+    for (const k of Object.keys(allValues)) {
+      if (allowed.has(k)) propsToSend[k] = allValues[k];
+    }
 
+    // Keys (por defecto Email+Campaign)
     const keyFields = (process.env.SFMC_KEY_FIELDS || 'Email,Campaign')
       .split(',').map(s => s.trim()).filter(Boolean);
 
-    // Validar que las keys estén en los valores resultantes
     for (const k of keyFields) {
-      if (!(k in valuesFiltered)) {
-        return res.status(400).json({ ok:false, error:'missing_key_field',
-          detail:`Key '${k}' no está presente en la DE o en el payload` });
+      if (!(k in propsToSend)) {
+        return res.status(400).json({ ok:false, error:'missing_key_field', detail:`Key '${k}' no está en propsToSend` });
       }
     }
 
-    // ---------- 6) Intento 1: Create + UpdateAdd (keys dentro de PROPERTIES) ----------
-    let soapResp = await soapCreateUpdateAdd_propsOnly({
-      token, deKey, values: valuesFiltered
-    });
+    const deKey = (process.env.SFMC_DE_KEY || '').trim();
+    if (!deKey) return res.status(500).json({ ok:false, error:'missing_env', detail:'SFMC_DE_KEY' });
+
+    // -------- 5) CREATE + UpdateAdd (keys en Properties) --------
+    let path = 'create';
+    let soapResp = await soapCreateUpdateAdd({ token, deKey, values: propsToSend });
     let parsed = parseSoapCreateResponse(soapResp.body);
 
-    // ---------- 7) Fallback: si hay violación UpdateAdd, hacemos Update ----------
+    // -------- 6) Fallback: Update (Keys + Properties no-clave) --------
     if (!parsed.ok && /UpdateAdd violation/i.test(parsed.status)) {
-      // keys explícitas + propiedades no-clave
+      path = 'update';
       const keyValues = {};
-      for (const k of keyFields) keyValues[k] = valuesFiltered[k];
+      keyFields.forEach(k => keyValues[k] = propsToSend[k]);
 
-      const nonKeyValues = { ...valuesFiltered };
-      for (const k of keyFields) delete nonKeyValues[k];
+      const nonKeyValues = { ...propsToSend };
+      keyFields.forEach(k => delete nonKeyValues[k]);
 
-      // Si no quedó nada, al menos Timestamp (si existe en la DE)
-      if (Object.keys(nonKeyValues).length === 0 && validFields.has('Timestamp')) {
+      // Si no quedó nada para actualizar, mandamos al menos Timestamp si existe
+      if (Object.keys(nonKeyValues).length === 0 && allowed.has('Timestamp')) {
         nonKeyValues.Timestamp = nowIso;
       }
 
       if (Object.keys(nonKeyValues).length === 0) {
         return res.status(400).json({ ok:false, error:'no_updatable_fields',
-          detail:'No hay campos no-clave existentes en la DE para actualizar.' });
+          detail:'No hay campos no-clave para Update' });
       }
 
       soapResp = await soapUpdate({ token, deKey, keyValues, values: nonKeyValues });
@@ -141,17 +132,21 @@ export default async function handler(req, res) {
     }
 
     if (!parsed.ok) {
-      return res.status(502).json({ ok:false, error:'sfmc_soap', detail: parsed });
+      const payload = { ok:false, error:'sfmc_soap', detail: parsed };
+      if (debugOn) payload.debug = {
+        path, propsSent: Object.keys(propsToSend), keyFields
+      };
+      return res.status(502).json(payload);
     }
 
-    return res.status(200).json({
+    const response = {
       ok: true,
       saved: {
-        email: valuesFiltered.Email,
-        campaign: valuesFiltered.Campaign,
-        discount: valuesFiltered.Discount ?? '',
-        result: valuesFiltered[RESULT_FIELD] ?? '',
-        variationId: valuesFiltered[VAR_FIELD] ?? ''
+        email: propsToSend.Email,
+        campaign: propsToSend.Campaign,
+        discount: propsToSend.Discount ?? '',
+        result: propsToSend[RESULT_FIELD] ?? '',
+        variationId: propsToSend[VAR_FIELD] ?? ''
       },
       soap: {
         status: soapResp.status,
@@ -159,7 +154,10 @@ export default async function handler(req, res) {
         overall: parsed.overall || '',
         statusMessage: parsed.status || ''
       }
-    });
+    };
+    if (debugOn) response.debug = { path, propsSent: Object.keys(propsToSend), keyFields };
+
+    return res.status(200).json(response);
 
   } catch (err) {
     console.error(err);
@@ -167,14 +165,15 @@ export default async function handler(req, res) {
   }
 }
 
-/* ================= helpers ================= */
+/* ===== Helpers ===== */
 function isValidEmail(e){
   return /^(([^<>()[\]\\.,;:\s@"]+(\.[^<>()[\]\\.,;:\s@"]+)*)|(".+"))@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\])|(([a-z\-0-9]+\.)+[a-z]{2,}))$/i.test(e);
 }
 async function readBody(req){ const bufs=[]; for await (const c of req) bufs.push(c); return Buffer.concat(bufs).toString('utf8'); }
 async function parseJSON(req){ const s = await readBody(req); return s ? JSON.parse(s) : {}; }
+function sha256Lower(email){ return crypto.createHash('sha256').update(String(email).toLowerCase()).digest('hex'); }
 
-async function getSfmcToken(){
+async function getSfmcToken() {
   const authBase = (process.env.SFMC_AUTH_BASE || '').replace(/\/+$/, '');
   const body = {
     grant_type: 'client_credentials',
@@ -192,7 +191,7 @@ async function getSfmcToken(){
   return j.access_token;
 }
 
-function normalizeSoapBase(soapBaseEnv, restBaseEnv){
+function normalizeSoapBase(soapBaseEnv, restBaseEnv) {
   if (soapBaseEnv && soapBaseEnv.trim()) {
     const base = soapBaseEnv.replace(/\/+$/, '');
     return /\/Service\.asmx$/i.test(base) ? base : base + '/Service.asmx';
@@ -206,59 +205,21 @@ function escapeXml(s){
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     .replace(/"/g,'&quot;').replace(/'/g,'&apos;');
 }
-function sha256Lower(email){
-  return crypto.createHash('sha256').update(String(email).toLowerCase()).digest('hex');
+
+function buildPropertiesXML(values){
+  return Object.keys(values).map(k => `
+    <Property><Name>${escapeXml(k)}</Name><Value>${escapeXml(values[k] == null ? '' : String(values[k]))}</Value></Property>
+  `).join('');
 }
-function pickExisting(obj, validSet){
-  const out = {};
-  for (const k of Object.keys(obj)) if (validSet.has(k)) out[k] = obj[k];
-  return out;
-}
-
-/* ===== SOAP: Retrieve campos de la DE ===== */
-async function retrieveDeFields({ token, deKey }) {
-  const soapBase = normalizeSoapBase(process.env.SFMC_SOAP_BASE, process.env.SFMC_REST_BASE);
-  const envelope = `<?xml version="1.0" encoding="UTF-8"?>
-<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
-  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-  xmlns:tns="http://exacttarget.com/wsdl/partnerAPI">
-  <soapenv:Header>
-    <fueloauth xmlns="http://exacttarget.com">${escapeXml(token)}</fueloauth>
-  </soapenv:Header>
-  <soapenv:Body>
-    <tns:RetrieveRequestMsg>
-      <tns:RetrieveRequest>
-        <tns:ObjectType>DataExtensionField</tns:ObjectType>
-        <tns:Properties>Name</tns:Properties>
-        <tns:Filter xsi:type="tns:SimpleFilterPart">
-          <tns:Property>CustomerKey</tns:Property>
-          <tns:SimpleOperator>equals</tns:SimpleOperator>
-          <tns:Value>${escapeXml(deKey)}</tns:Value>
-        </tns:Filter>
-      </tns:RetrieveRequest>
-    </tns:RetrieveRequestMsg>
-  </soapenv:Body>
-</soapenv:Envelope>`;
-
-  const r = await fetch(soapBase, {
-    method:'POST',
-    headers:{ 'Content-Type':'text/xml; charset=utf-8', 'SOAPAction':'Retrieve' },
-    body: envelope
-  });
-  const text = await r.text();
-  if (!r.ok) throw new Error(`SOAP retrieve error ${r.status}: ${text}`);
-
-  // Extrae todos los <Name>...</Name> de DataExtensionField
-  const names = Array.from(text.matchAll(/<Name>([^<]+)<\/Name>/gi)).map(m => m[1]);
-  // Evita duplicados y devuelve la lista
-  return [...new Set(names)];
+function buildKeysXML(keyValues){
+  return Object.keys(keyValues).map(k => `
+    <tns:Key><tns:Name>${escapeXml(k)}</tns:Name><tns:Value>${escapeXml(keyValues[k] == null ? '' : String(keyValues[k]))}</tns:Value></tns:Key>
+  `).join('');
 }
 
-/* ===== SOAP: Create (UpdateAdd con keys en Properties) ===== */
-async function soapCreateUpdateAdd_propsOnly({ token, deKey, values }) {
+async function soapCreateUpdateAdd({ token, deKey, values }) {
   const soapBase = normalizeSoapBase(process.env.SFMC_SOAP_BASE, process.env.SFMC_REST_BASE);
   const propsXML = buildPropertiesXML(values);
-
   const envelope = `<?xml version="1.0" encoding="UTF-8"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -283,18 +244,12 @@ async function soapCreateUpdateAdd_propsOnly({ token, deKey, values }) {
     </tns:CreateRequest>
   </soapenv:Body>
 </soapenv:Envelope>`;
-
-  const r = await fetch(soapBase, {
-    method:'POST',
-    headers:{ 'Content-Type':'text/xml; charset=utf-8', 'SOAPAction':'Create' },
-    body: envelope
-  });
+  const r = await fetch(soapBase, { method:'POST', headers:{ 'Content-Type':'text/xml; charset=utf-8', 'SOAPAction':'Create' }, body: envelope });
   const text = await r.text();
   if (!r.ok) throw new Error(`SOAP error ${r.status}: ${text}`);
   return { status: r.status, body: text };
 }
 
-/* ===== SOAP: Update (Keys + Properties) ===== */
 async function soapUpdate({ token, deKey, keyValues, values }) {
   const soapBase = normalizeSoapBase(process.env.SFMC_SOAP_BASE, process.env.SFMC_REST_BASE);
   const propsXML = buildPropertiesXML(values);
@@ -317,18 +272,12 @@ async function soapUpdate({ token, deKey, keyValues, values }) {
     </tns:UpdateRequest>
   </soapenv:Body>
 </soapenv:Envelope>`;
-
-  const r = await fetch(soapBase, {
-    method:'POST',
-    headers:{ 'Content-Type':'text/xml; charset=utf-8', 'SOAPAction':'Update' },
-    body: envelope
-  });
+  const r = await fetch(soapBase, { method:'POST', headers:{ 'Content-Type':'text/xml; charset=utf-8', 'SOAPAction':'Update' }, body: envelope });
   const text = await r.text();
   if (!r.ok) throw new Error(`SOAP error ${r.status}: ${text}`);
   return { status: r.status, body: text };
 }
 
-/* ===== SOAP parsers ===== */
 function parseSoapCreateResponse(xml){
   const overall = (xml.match(/<OverallStatus>([^<]+)<\/OverallStatus>/i) || [])[1] || '';
   const status  = (xml.match(/<StatusMessage>([^<]+)<\/StatusMessage>/i) || [])[1] || '';
@@ -343,18 +292,4 @@ function parseSoapUpdateResponse(xml){
   const reqId   = (xml.match(/<RequestID>([^<]+)<\/RequestID>/i) || [])[1] || '';
   const ok = /OK/i.test(overall) || /OK/i.test(status);
   return { ok, overall, status, requestId: reqId, errors: [] };
-}
-
-function buildPropertiesXML(values){
-  return Object.keys(values).map(k => `
-    <Property>
-      <Name>${escapeXml(k)}</Name>
-      <Value>${escapeXml(values[k] == null ? '' : String(values[k]))}</Value>
-    </Property>
-  `).join('');
-}
-function buildKeysXML(keyValues){
-  return Object.keys(keyValues).map(k => `
-    <tns:Key><tns:Name>${escapeXml(k)}</tns:Name><tns:Value>${escapeXml(keyValues[k] == null ? '' : String(keyValues[k]))}</tns:Value></tns:Key>
-  `).join('');
 }
