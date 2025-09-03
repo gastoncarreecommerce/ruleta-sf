@@ -4,19 +4,21 @@ import crypto from 'crypto';
 /** ENV requeridas:
  * SFMC_CLIENT_ID, SFMC_CLIENT_SECRET, SFMC_AUTH_BASE, SFMC_REST_BASE,
  * SFMC_SOAP_BASE (con /Service.asmx), SFMC_DE_KEY
- * Opcionales: SFMC_ACCOUNT_ID (MID), SFMC_RESULT_FIELD, SFMC_VARIATION_FIELD,
- * SFMC_SOURCE_VALUE, SAVE_ONLY_WINNERS=1, SFMC_SEND_RESULT=0, SFMC_SEND_VARIATION=0,
- * SFMC_KEY_FIELDS="Email,Campaign"  (si tus claves tuvieran otros nombres)
+ * Opcionales:
+ * SFMC_ACCOUNT_ID (MID), SFMC_RESULT_FIELD, SFMC_VARIATION_FIELD, SFMC_SOURCE_VALUE,
+ * SAVE_ONLY_WINNERS=1, SFMC_SEND_RESULT=0, SFMC_SEND_VARIATION=0,
+ * SFMC_KEY_FIELDS="Email,Campaign"
  */
 
 export default async function handler(req, res) {
+  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST,GET,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(204).end();
 
   try {
-    // -------- 1) INPUTS --------
+    /* -------- 1) INPUTS -------- */
     const url = new URL(req.url, `http://${req.headers.host}`);
     const q = Object.fromEntries(url.searchParams.entries());
 
@@ -24,11 +26,10 @@ export default async function handler(req, res) {
     let discount = q.discount != null ? Number(q.discount) : null;
     const campaign = q.campaign || 'default';
     let variationId = q.variationId || null;
-    let result = (q.result || '').toLowerCase();
+    let result = (q.result || '').toLowerCase(); // won|lost
 
     if (req.method === 'POST') {
       const ctype = (req.headers['content-type'] || '').toLowerCase();
-
       if (ctype.includes('application/x-www-form-urlencoded')) {
         const bodyStr = await readBody(req);
         const params = new URLSearchParams(bodyStr);
@@ -47,7 +48,7 @@ export default async function handler(req, res) {
       email = q.email || email;
     }
 
-    // -------- 2) VALIDACIONES --------
+    /* -------- 2) VALIDACIONES -------- */
     if (!email || !isValidEmail(email)) {
       return res.status(400).json({ ok: false, error: 'invalid_email' });
     }
@@ -56,20 +57,22 @@ export default async function handler(req, res) {
     }
     if (result && result !== 'won' && result !== 'lost') result = '';
 
+    // Guardar solo ganadores (si se pide)
     if (process.env.SAVE_ONLY_WINNERS === '1' && result !== 'won') {
       return res.status(200).json({ ok: true, skipped: 'not_winner' });
     }
 
-    // -------- 3) TOKEN --------
+    /* -------- 3) TOKEN -------- */
     const token = await getSfmcToken();
 
-    // -------- 4) ARMADO DE VALORES --------
+    /* -------- 4) ARMAR VALORES -------- */
     const nowIso = new Date().toISOString();
     const hashed = sha256Lower(email);
 
     const RESULT_FIELD = process.env.SFMC_RESULT_FIELD || 'Result';
     const VAR_FIELD    = process.env.SFMC_VARIATION_FIELD || 'VariationId';
 
+    // Campos a guardar (no incluimos Discount vacío)
     const values = {
       Email: email,
       Campaign: campaign,
@@ -81,21 +84,22 @@ export default async function handler(req, res) {
     if (process.env.SFMC_SEND_RESULT !== '0')    values[RESULT_FIELD] = result || '';
     if (process.env.SFMC_SEND_VARIATION !== '0') values[VAR_FIELD]    = variationId || '';
 
-    // Claves (por defecto Email,Campaign)
+    // Claves (por defecto Email + Campaign)
     const keyFields = (process.env.SFMC_KEY_FIELDS || 'Email,Campaign')
-      .split(',').map(s => s.trim()).filter(Boolean);
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
     const keyValues = {};
     for (const k of keyFields) keyValues[k] = values[k];
 
-    // -------- 5) UPSERT (Create con UpdateAdd + fallback a Update) --------
     const deKey = process.env.SFMC_DE_KEY;
     if (!deKey) throw new Error('Missing SFMC_DE_KEY');
 
-    // Intento 1: CreateRequest con SaveAction=UpdateAdd (incluye <Keys>)
+    /* -------- 5) Create (UpdateAdd) con <Keys> + fallback a Update -------- */
     let soapResp = await soapCreateUpdateAdd({ token, deKey, values, keyValues });
     let parsed = parseSoapCreateResponse(soapResp.body);
 
-    // Si devuelve la violación 68001, hacemos UpdateRequest con <Keys>
+    // Si hay 68001 (duplicado/violación), hacemos Update con <Keys>
     if (!parsed.ok && /UpdateAdd violation/i.test(parsed.status)) {
       soapResp = await soapUpdate({ token, deKey, values, keyValues });
       parsed = parseSoapUpdateResponse(soapResp.body);
@@ -164,10 +168,10 @@ function normalizeSoapBase(soapBaseEnv, restBaseEnv) {
 }
 
 function escapeXml(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
     .replace(/"/g,'&quot;').replace(/'/g,'&apos;');
 }
-
 function sha256Lower(email) {
   return crypto.createHash('sha256').update(String(email).toLowerCase()).digest('hex');
 }
@@ -175,18 +179,25 @@ function sha256Lower(email) {
 /* ===== SOAP builders ===== */
 
 function buildPropertiesXML(values) {
-  return Object.keys(values).map(k => `
-    <Property><Name>${escapeXml(k)}</Name><Value>${escapeXml(values[k] == null ? '' : String(values[k]))}</Value></Property>
+  const keys = Object.keys(values);
+  if (!keys.length) return ''; // por las dudas
+  return keys.map(k => `
+    <Property>
+      <Name>${escapeXml(k)}</Name>
+      <Value>${escapeXml(values[k] == null ? '' : String(values[k]))}</Value>
+    </Property>
   `).join('');
 }
-
 function buildKeysXML(keyValues) {
   return Object.keys(keyValues).map(k => `
-    <tns:Key><tns:Name>${escapeXml(k)}</tns:Name><tns:Value>${escapeXml(keyValues[k] == null ? '' : String(keyValues[k]))}</tns:Value></tns:Key>
+    <tns:Key>
+      <tns:Name>${escapeXml(k)}</tns:Name>
+      <tns:Value>${escapeXml(keyValues[k] == null ? '' : String(keyValues[k]))}</tns:Value>
+    </tns:Key>
   `).join('');
 }
 
-/* CreateRequest con SaveAction=UpdateAdd + <Keys> */
+/* Create (UpdateAdd) con <Keys> */
 async function soapCreateUpdateAdd({ token, deKey, values, keyValues }) {
   const soapBase = normalizeSoapBase(process.env.SFMC_SOAP_BASE, process.env.SFMC_REST_BASE);
   const propsXML = buildPropertiesXML(values);
@@ -226,13 +237,16 @@ async function soapCreateUpdateAdd({ token, deKey, values, keyValues }) {
   return { status: r.status, body: text };
 }
 
-/* UpdateRequest usando <Keys> para identificar la fila */
+/* Update con <Keys> (si hay violación de UpdateAdd) */
 async function soapUpdate({ token, deKey, values, keyValues }) {
   const soapBase = normalizeSoapBase(process.env.SFMC_SOAP_BASE, process.env.SFMC_REST_BASE);
 
-  // En Update mandamos solo los campos "no clave". Si Discount no vino, no lo tocamos.
+  // En Update mandamos solo campos NO clave; si quedara vacío, forzamos Timestamp
   const v2 = { ...values };
   for (const k of Object.keys(keyValues)) delete v2[k];
+  if (!Object.keys(v2).length) {
+    v2.Timestamp = new Date().toISOString(); // asegura que siempre haya al menos 1 Property
+  }
 
   const propsXML = buildPropertiesXML(v2);
   const keysXML  = buildKeysXML(keyValues);
