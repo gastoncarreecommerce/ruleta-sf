@@ -21,17 +21,17 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   try {
-    const { put } = await import("@vercel/blob"); // ⬅️ dynamic import
+    const { put } = await import("@vercel/blob"); // sin token
 
     const url = new URL(req.url, `http://${req.headers.host}`);
 
-    // Secret simple
+    // Secret opcional
     const secret = url.searchParams.get("secret") || "";
     if (process.env.SHARED_SECRET && secret !== process.env.SHARED_SECRET) {
       return res.status(401).json({ ok: false, error: "unauthorized" });
     }
 
-    // Params
+    // Params de query/body
     let email = url.searchParams.get("email") || null;
     let discount = url.searchParams.get("discount");
     let result = (url.searchParams.get("result") || "").toLowerCase();
@@ -91,12 +91,7 @@ export default async function handler(req, res) {
     const { url: blobUrl } = await put(
       key,
       JSON.stringify(record) + "\n",
-      {
-        access: "public", // público para export fácil
-        contentType: "application/json",
-        addRandomSuffix: false,
-        token: process.env.BLOB_READ_WRITE_TOKEN
-      }
+      { access: "public", contentType: "application/json", addRandomSuffix: false } // sin token
     );
 
     return res.status(200).json({ ok: true, saved: record, blobKey: key, url: blobUrl });
