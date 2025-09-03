@@ -1,14 +1,15 @@
 // api/ruleta-sfmc.js
 import crypto from 'crypto';
 
-/**
- * Endpoint que recibe:
- *  - query:  campaign
- *  - body x-www-form-urlencoded | json: email, result (won|lost), discount (número), variationId
- * Guarda/actualiza fila en la Data Extension vía SOAP (UpdateAdd).
+/** ENV requeridas:
+ * SFMC_CLIENT_ID, SFMC_CLIENT_SECRET, SFMC_AUTH_BASE, SFMC_REST_BASE,
+ * SFMC_SOAP_BASE (con /Service.asmx), SFMC_DE_KEY
+ * Opcionales: SFMC_ACCOUNT_ID (MID), SFMC_RESULT_FIELD, SFMC_VARIATION_FIELD,
+ * SFMC_SOURCE_VALUE, SAVE_ONLY_WINNERS=1, SFMC_SEND_RESULT=0, SFMC_SEND_VARIATION=0,
+ * SFMC_KEY_FIELDS="Email,Campaign"  (si tus claves tuvieran otros nombres)
  */
+
 export default async function handler(req, res) {
-  // CORS (endurecer en prod si querés)
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST,GET,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -23,7 +24,7 @@ export default async function handler(req, res) {
     let discount = q.discount != null ? Number(q.discount) : null;
     const campaign = q.campaign || 'default';
     let variationId = q.variationId || null;
-    let result = (q.result || '').toLowerCase(); // 'won' | 'lost'
+    let result = (q.result || '').toLowerCase();
 
     if (req.method === 'POST') {
       const ctype = (req.headers['content-type'] || '').toLowerCase();
@@ -31,7 +32,6 @@ export default async function handler(req, res) {
       if (ctype.includes('application/x-www-form-urlencoded')) {
         const bodyStr = await readBody(req);
         const params = new URLSearchParams(bodyStr);
-
         email = params.get('email') || email;
         if (params.has('discount') && discount == null) discount = Number(params.get('discount'));
         if (params.has('variationId') && !variationId) variationId = params.get('variationId');
@@ -56,7 +56,6 @@ export default async function handler(req, res) {
     }
     if (result && result !== 'won' && result !== 'lost') result = '';
 
-    // Guardar solo ganadores (opcional)
     if (process.env.SAVE_ONLY_WINNERS === '1' && result !== 'won') {
       return res.status(200).json({ ok: true, skipped: 'not_winner' });
     }
@@ -64,14 +63,13 @@ export default async function handler(req, res) {
     // -------- 3) TOKEN --------
     const token = await getSfmcToken();
 
-    // -------- 4) UP SERT EN DE (SOAP) --------
+    // -------- 4) ARMADO DE VALORES --------
     const nowIso = new Date().toISOString();
     const hashed = sha256Lower(email);
 
     const RESULT_FIELD = process.env.SFMC_RESULT_FIELD || 'Result';
     const VAR_FIELD    = process.env.SFMC_VARIATION_FIELD || 'VariationId';
 
-    // Nunca mandamos Discount vacío para no pisar un valor previo en un "lost"
     const values = {
       Email: email,
       Campaign: campaign,
@@ -83,14 +81,26 @@ export default async function handler(req, res) {
     if (process.env.SFMC_SEND_RESULT !== '0')    values[RESULT_FIELD] = result || '';
     if (process.env.SFMC_SEND_VARIATION !== '0') values[VAR_FIELD]    = variationId || '';
 
-    const soapResp = await soapUpsertRow({
-      token,
-      deKey: process.env.SFMC_DE_KEY,
-      values
-    });
+    // Claves (por defecto Email,Campaign)
+    const keyFields = (process.env.SFMC_KEY_FIELDS || 'Email,Campaign')
+      .split(',').map(s => s.trim()).filter(Boolean);
+    const keyValues = {};
+    for (const k of keyFields) keyValues[k] = values[k];
 
-    // Parseamos respuesta SOAP para detectar errores lógicos (aunque HTTP sea 200)
-    const parsed = parseSoapCreateResponse(soapResp.body);
+    // -------- 5) UPSERT (Create con UpdateAdd + fallback a Update) --------
+    const deKey = process.env.SFMC_DE_KEY;
+    if (!deKey) throw new Error('Missing SFMC_DE_KEY');
+
+    // Intento 1: CreateRequest con SaveAction=UpdateAdd (incluye <Keys>)
+    let soapResp = await soapCreateUpdateAdd({ token, deKey, values, keyValues });
+    let parsed = parseSoapCreateResponse(soapResp.body);
+
+    // Si devuelve la violación 68001, hacemos UpdateRequest con <Keys>
+    if (!parsed.ok && /UpdateAdd violation/i.test(parsed.status)) {
+      soapResp = await soapUpdate({ token, deKey, values, keyValues });
+      parsed = parseSoapUpdateResponse(soapResp.body);
+    }
+
     if (!parsed.ok) {
       return res.status(502).json({ ok: false, error: 'sfmc_soap', detail: parsed });
     }
@@ -98,17 +108,17 @@ export default async function handler(req, res) {
     return res.status(200).json({
       ok: true,
       saved: {
-        email,
-        campaign,
+        email: values.Email,
+        campaign: values.Campaign,
         discount: values.Discount ?? '',
         result: values[RESULT_FIELD] ?? '',
         variationId: values[VAR_FIELD] ?? ''
       },
       soap: {
         status: soapResp.status,
-        requestId: parsed.requestId,
-        overall: parsed.overall,
-        statusMessage: parsed.status
+        requestId: parsed.requestId || '',
+        overall: parsed.overall || '',
+        statusMessage: parsed.status || ''
       }
     });
   } catch (err) {
@@ -117,22 +127,13 @@ export default async function handler(req, res) {
   }
 }
 
-/* ========== HELPERS ========== */
+/* ================= HELPERS ================= */
 
 function isValidEmail(email) {
   return /^(([^<>()[\]\\.,;:\s@"]+(\.[^<>()[\]\\.,;:\s@"]+)*)|(".+"))@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\])|(([a-z\-0-9]+\.)+[a-z]{2,}))$/i.test(email);
 }
-
-async function readBody(req) {
-  const buffers = [];
-  for await (const chunk of req) buffers.push(chunk);
-  return Buffer.concat(buffers).toString('utf8');
-}
-
-async function parseJSON(req) {
-  const str = await readBody(req);
-  return str ? JSON.parse(str) : {};
-}
+async function readBody(req) { const bufs = []; for await (const c of req) bufs.push(c); return Buffer.concat(bufs).toString('utf8'); }
+async function parseJSON(req) { const s = await readBody(req); return s ? JSON.parse(s) : {}; }
 
 async function getSfmcToken() {
   const authBase = (process.env.SFMC_AUTH_BASE || '').replace(/\/+$/, '');
@@ -144,9 +145,7 @@ async function getSfmcToken() {
   if (process.env.SFMC_ACCOUNT_ID) body.account_id = process.env.SFMC_ACCOUNT_ID;
 
   const r = await fetch(`${authBase}/v2/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
   });
   if (!r.ok) throw new Error(`Token error: ${r.status} ${await r.text()}`);
   const j = await r.json();
@@ -154,7 +153,6 @@ async function getSfmcToken() {
   return j.access_token;
 }
 
-// Garantiza que el SOAP base termine en /Service.asmx, o lo deriva desde REST si faltara
 function normalizeSoapBase(soapBaseEnv, restBaseEnv) {
   if (soapBaseEnv && soapBaseEnv.trim()) {
     const base = soapBaseEnv.replace(/\/+$/, '');
@@ -165,25 +163,40 @@ function normalizeSoapBase(soapBaseEnv, restBaseEnv) {
   return rest.replace('rest.', 'soap.') + '/Service.asmx';
 }
 
-async function soapUpsertRow({ token, deKey, values }) {
-  if (!deKey) throw new Error('Missing SFMC_DE_KEY');
-  const soapBase = normalizeSoapBase(process.env.SFMC_SOAP_BASE, process.env.SFMC_REST_BASE);
+function escapeXml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&apos;');
+}
 
-  const propsXML = Object.keys(values)
-    .map((k) => `
-      <Property>
-        <Name>${escapeXml(k)}</Name>
-        <Value>${escapeXml(values[k] == null ? '' : String(values[k]))}</Value>
-      </Property>`)
-    .join('');
+function sha256Lower(email) {
+  return crypto.createHash('sha256').update(String(email).toLowerCase()).digest('hex');
+}
+
+/* ===== SOAP builders ===== */
+
+function buildPropertiesXML(values) {
+  return Object.keys(values).map(k => `
+    <Property><Name>${escapeXml(k)}</Name><Value>${escapeXml(values[k] == null ? '' : String(values[k]))}</Value></Property>
+  `).join('');
+}
+
+function buildKeysXML(keyValues) {
+  return Object.keys(keyValues).map(k => `
+    <tns:Key><tns:Name>${escapeXml(k)}</tns:Name><tns:Value>${escapeXml(keyValues[k] == null ? '' : String(keyValues[k]))}</tns:Value></tns:Key>
+  `).join('');
+}
+
+/* CreateRequest con SaveAction=UpdateAdd + <Keys> */
+async function soapCreateUpdateAdd({ token, deKey, values, keyValues }) {
+  const soapBase = normalizeSoapBase(process.env.SFMC_SOAP_BASE, process.env.SFMC_REST_BASE);
+  const propsXML = buildPropertiesXML(values);
+  const keysXML  = buildKeysXML(keyValues);
 
   const envelope = `<?xml version="1.0" encoding="UTF-8"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
   xmlns:tns="http://exacttarget.com/wsdl/partnerAPI">
-  <soapenv:Header>
-    <fueloauth xmlns="http://exacttarget.com">${escapeXml(token)}</fueloauth>
-  </soapenv:Header>
+  <soapenv:Header><fueloauth xmlns="http://exacttarget.com">${escapeXml(token)}</fueloauth></soapenv:Header>
   <soapenv:Body>
     <tns:CreateRequest>
       <tns:Options>
@@ -196,8 +209,8 @@ async function soapUpsertRow({ token, deKey, values }) {
       </tns:Options>
       <tns:Objects xsi:type="tns:DataExtensionObject">
         <tns:CustomerKey>${escapeXml(deKey)}</tns:CustomerKey>
-        <tns:Properties>${propsXML}
-        </tns:Properties>
+        <tns:Keys>${keysXML}</tns:Keys>
+        <tns:Properties>${propsXML}</tns:Properties>
       </tns:Objects>
     </tns:CreateRequest>
   </soapenv:Body>
@@ -205,19 +218,52 @@ async function soapUpsertRow({ token, deKey, values }) {
 
   const r = await fetch(soapBase, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'text/xml; charset=utf-8',
-      'SOAPAction': 'Create'
-    },
+    headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': 'Create' },
     body: envelope
   });
-
-  const text = await r.text(); // SOAP devuelve 200 incluso con errores lógicos
+  const text = await r.text();
   if (!r.ok) throw new Error(`SOAP error ${r.status}: ${text}`);
   return { status: r.status, body: text };
 }
 
-// Devuelve ok=false si OverallStatus/StatusMessage no son OK; trae RequestID y ErrorCode(s)
+/* UpdateRequest usando <Keys> para identificar la fila */
+async function soapUpdate({ token, deKey, values, keyValues }) {
+  const soapBase = normalizeSoapBase(process.env.SFMC_SOAP_BASE, process.env.SFMC_REST_BASE);
+
+  // En Update mandamos solo los campos "no clave". Si Discount no vino, no lo tocamos.
+  const v2 = { ...values };
+  for (const k of Object.keys(keyValues)) delete v2[k];
+
+  const propsXML = buildPropertiesXML(v2);
+  const keysXML  = buildKeysXML(keyValues);
+
+  const envelope = `<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:tns="http://exacttarget.com/wsdl/partnerAPI">
+  <soapenv:Header><fueloauth xmlns="http://exacttarget.com">${escapeXml(token)}</fueloauth></soapenv:Header>
+  <soapenv:Body>
+    <tns:UpdateRequest>
+      <tns:Objects xsi:type="tns:DataExtensionObject">
+        <tns:CustomerKey>${escapeXml(deKey)}</tns:CustomerKey>
+        <tns:Keys>${keysXML}</tns:Keys>
+        <tns:Properties>${propsXML}</tns:Properties>
+      </tns:Objects>
+    </tns:UpdateRequest>
+  </soapenv:Body>
+</soapenv:Envelope>`;
+
+  const r = await fetch(soapBase, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/xml; charset=utf-8', 'SOAPAction': 'Update' },
+    body: envelope
+  });
+  const text = await r.text();
+  if (!r.ok) throw new Error(`SOAP error ${r.status}: ${text}`);
+  return { status: r.status, body: text };
+}
+
+/* ===== SOAP parsers ===== */
 function parseSoapCreateResponse(xml) {
   const overall = (xml.match(/<OverallStatus>([^<]+)<\/OverallStatus>/i) || [])[1] || '';
   const status  = (xml.match(/<StatusMessage>([^<]+)<\/StatusMessage>/i) || [])[1] || '';
@@ -226,16 +272,10 @@ function parseSoapCreateResponse(xml) {
   const ok = /OK/i.test(overall) || /OK/i.test(status);
   return { ok, overall, status, requestId: reqId, errors: codes };
 }
-
-function escapeXml(s) {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
-}
-
-function sha256Lower(email) {
-  return crypto.createHash('sha256').update(String(email).toLowerCase()).digest('hex');
+function parseSoapUpdateResponse(xml) {
+  const overall = (xml.match(/<OverallStatus>([^<]+)<\/OverallStatus>/i) || [])[1] || '';
+  const status  = (xml.match(/<StatusMessage>([^<]+)<\/StatusMessage>/i) || [])[1] || '';
+  const reqId   = (xml.match(/<RequestID>([^<]+)<\/RequestID>/i) || [])[1] || '';
+  const ok = /OK/i.test(overall) || /OK/i.test(status);
+  return { ok, overall, status, requestId: reqId, errors: [] };
 }
